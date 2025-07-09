@@ -2,15 +2,16 @@ package store
 
 import (
 	"context"
-	"database/sql"
+	"encoding/base64"
 	"encoding/json"
-	"fmt"
-	"strings"
-
 	"endorsement-distribution/internal/config"
-	"endorsement-distribution/internal/coserv"
+	"errors"
+	"fmt"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/veraison/corim/comid"
+	"github.com/veraison/corim/coserv"
+	"github.com/veraison/services/scheme/common/arm"
 	"go.uber.org/zap"
 )
 
@@ -73,7 +74,7 @@ func (s *PostgresStore) setupTable() error {
 // Get retrieves artifacts for a given key
 func (s *PostgresStore) Get(key string) ([][]byte, error) {
 	query := `SELECT kv_val FROM endorsements WHERE kv_key = $1`
-	
+
 	rows, err := s.pool.Query(context.Background(), query, key)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query database: %w", err)
@@ -173,6 +174,11 @@ type EndorsementDistributor struct {
 	logger *zap.SugaredLogger
 }
 
+type SynthCoservQueryKeysArgs struct {
+	TenantID string
+	Query    string
+}
+
 // NewEndorsementDistributor creates a new endorsement distributor
 func NewEndorsementDistributor(store Store, logger *zap.SugaredLogger) *EndorsementDistributor {
 	return &EndorsementDistributor{
@@ -184,13 +190,13 @@ func NewEndorsementDistributor(store Store, logger *zap.SugaredLogger) *Endorsem
 // GetEndorsements retrieves endorsements for a CoSERV query
 func (ed *EndorsementDistributor) GetEndorsements(tenantID, coservQuery, mediaType string) ([]byte, error) {
 	// Parse CoSERV query
-	var coserv coserv.CoSERV
+	var coserv coserv.Coserv
 	if err := coserv.FromBase64Url(coservQuery); err != nil {
 		return nil, fmt.Errorf("failed to parse CoSERV query: %w", err)
 	}
 
 	// Generate database key
-	key, err := coserv.GenerateKey(tenantID)
+	key, err := GenerateKey(tenantID, coservQuery)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate key: %w", err)
 	}
@@ -204,7 +210,7 @@ func (ed *EndorsementDistributor) GetEndorsements(tenantID, coservQuery, mediaTy
 	}
 
 	// Get profile for result
-	profile, err := coserv.GetProfile()
+	profile, err := GetProfile()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get profile: %w", err)
 	}
@@ -219,4 +225,72 @@ func (ed *EndorsementDistributor) GetEndorsements(tenantID, coservQuery, mediaTy
 	}
 
 	return resultData, nil
-} 
+}
+
+// GenerateKey generates lookup keys for a given tenant and CoSERV query.
+// It synthesizes keys based on the artifact type and environment selector.
+func GenerateKey(tenantID string, query string) ([]string, error) {
+	var q coserv.Coserv
+	if err := q.FromBase64Url(query); err != nil {
+		return nil, err
+	}
+
+	var keys []string
+
+	switch q.Query.ArtifactType {
+	case coserv.ArtifactTypeReferenceValues:
+		s := q.Query.EnvironmentSelector
+
+		if s.Classes != nil {
+			for i, v := range *s.Classes {
+				implID, err := extractImplID(v)
+				if err != nil {
+					return nil, fmt.Errorf("creating lookup key for class[%d]: %w", i, err)
+				}
+
+				keys = append(keys, arm.RefValLookupKey(SchemeName, tenantID, implID))
+			}
+			fmt.Println("Ref Val - synthesized Keys are :", keys)
+		}
+	case coserv.ArtifactTypeTrustAnchors:
+		s := q.Query.EnvironmentSelector
+
+		if s.Instances != nil {
+			for i, v := range *s.Instances {
+				instID, err := extractInstID(v)
+				if err != nil {
+					return nil, fmt.Errorf("creating lookup key for instance[%d]: %w", i, err)
+				}
+
+				keys = append(keys, arm.TaCoservLookupKey(SchemeName, tenantID, instID))
+			}
+			fmt.Println("Trust Anchor - synthesized Keys are :", keys)
+		}
+	case coserv.ArtifactTypeEndorsedValues:
+		return nil, fmt.Errorf("CCA does not implement endorsed value queries")
+	}
+
+	return keys, nil
+}
+
+func extractImplID(c comid.Class) (string, error) {
+	if c.ClassID == nil {
+		return "", errors.New("missing class-id")
+	}
+
+	implID, err := c.ClassID.GetImplID()
+	if err != nil {
+		return "", fmt.Errorf("could not extract implementation-id from class-id: %w", err)
+	}
+
+	return implID.String(), nil
+}
+
+func extractInstID(i comid.Instance) (string, error) {
+	instID, err := i.GetUEID()
+	if err != nil {
+		return "", fmt.Errorf("could not extract implementation-id from instance-id: %w", err)
+	}
+
+	return base64.StdEncoding.EncodeToString(instID), nil
+}
